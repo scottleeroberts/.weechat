@@ -1,6 +1,6 @@
 # Copyright (c) 2014-2016 Ryan Huber <rhuber@gmail.com>
 # Copyright (c) 2015-2018 Tollef Fog Heen <tfheen@err.no>
-# Copyright (c) 2015-2019 Trygve Aaberge <trygveaa@gmail.com>
+# Copyright (c) 2015-2020 Trygve Aaberge <trygveaa@gmail.com>
 # Released under the MIT license.
 
 from __future__ import print_function, unicode_literals
@@ -8,7 +8,7 @@ from __future__ import print_function, unicode_literals
 from collections import OrderedDict
 from functools import wraps
 from io import StringIO
-from itertools import islice, count
+from itertools import chain, count, islice
 
 import errno
 import textwrap
@@ -56,9 +56,10 @@ except ImportError:
 
 SCRIPT_NAME = "slack"
 SCRIPT_AUTHOR = "Ryan Huber <rhuber@gmail.com>"
-SCRIPT_VERSION = "2.3.0"
+SCRIPT_VERSION = "2.4.0"
 SCRIPT_LICENSE = "MIT"
 SCRIPT_DESC = "Extends weechat for typing notification/search/etc on slack.com"
+REPO_URL = "https://github.com/wee-slack/wee-slack"
 
 BACKLOG_SIZE = 200
 SCROLLBACK_SIZE = 500
@@ -167,7 +168,8 @@ if hasattr(ssl, "get_default_verify_paths") and callable(ssl.get_default_verify_
     if ssl_defaults.cafile is not None:
         sslopt_ca_certs = {'ca_certs': ssl_defaults.cafile}
 
-EMOJI = []
+EMOJI = {}
+EMOJI_WITH_SKIN_TONES_REVERSE = {}
 
 ###### Unicode handling
 
@@ -275,6 +277,10 @@ class ProxyWrapper(object):
 ##### Helpers
 
 
+def print_error(message, buffer=''):
+    w.prnt(buffer, '{}Error: {}'.format(w.prefix('error'), message))
+
+
 def format_exc_tb():
     return decode_from_utf8(traceback.format_exc())
 
@@ -284,12 +290,22 @@ def format_exc_only():
     return ''.join(decode_from_utf8(traceback.format_exception_only(etype, value)))
 
 
-def get_nick_color_name(nick):
+def get_nick_color(nick, name=False):
     info_name_prefix = "irc_" if int(weechat_version) < 0x1050000 else ""
-    return w.info_get(info_name_prefix + "nick_color_name", nick)
+    name_suffix = "_name" if name else ""
+    return w.info_get(info_name_prefix + "nick_color" + name_suffix, nick)
+
+
+def get_thread_color(thread_id):
+    if config.color_thread_suffix == 'multiple':
+        return get_nick_color(thread_id, name=False)
+    else:
+        return w.color(config.color_thread_suffix)
+
 
 def sha1_hex(s):
     return hashlib.sha1(s.encode('utf-8')).hexdigest()
+
 
 def get_functions_with_prefix(prefix):
     return {name[len(prefix):]: ref for name, ref in globals().items()
@@ -307,6 +323,26 @@ def handle_socket_error(exception, team, caller_name):
     dbg('Socket failed on {} with exception:\n{}'.format(
         caller_name, format_exc_tb()), level=5)
     team.set_disconnected()
+
+
+EMOJI_NAME_REGEX = re.compile(':([^: ]+):')
+EMOJI_REGEX_STRING = '[\U00000080-\U0010ffff]+'
+
+
+def regex_match_to_emoji(match):
+    emoji = match.group(1)
+    return EMOJI.get(emoji, match.group())
+
+
+def replace_string_with_emoji(text):
+    if config.render_emoji_as_string:
+        return text
+    else:
+        return EMOJI_NAME_REGEX.sub(regex_match_to_emoji, text)
+
+
+def replace_emoji_with_string(text):
+    return EMOJI_WITH_SKIN_TONES_REVERSE.get(text, text)
 
 
 ###### New central Event router
@@ -792,13 +828,15 @@ def buffer_input_callback(signal, buffer_ptr, data):
             return int(message_id)
 
     message_id_regex = r"(\d*|\$[0-9a-fA-F]{3,})"
-    reaction = re.match(r"^{}(\+|-):(.*):\s*$".format(message_id_regex), data)
+    reaction = re.match(r"^{}(\+|-)(:(.+):|{})\s*$".format(message_id_regex, EMOJI_REGEX_STRING), data)
     substitute = re.match("^{}s/".format(message_id_regex), data)
     if reaction:
+        emoji_match = reaction.group(4) or reaction.group(3)
+        emoji = replace_emoji_with_string(emoji_match)
         if reaction.group(2) == "+":
-            channel.send_add_reaction(get_id(reaction.group(1)), reaction.group(3))
+            channel.send_add_reaction(get_id(reaction.group(1)), emoji)
         elif reaction.group(2) == "-":
-            channel.send_remove_reaction(get_id(reaction.group(1)), reaction.group(3))
+            channel.send_remove_reaction(get_id(reaction.group(1)), emoji)
     elif substitute:
         msg_id = get_id(substitute.group(1))
         try:
@@ -1268,7 +1306,7 @@ class SlackTeam(object):
         return self.users.keys()
 
     def load_emoji_completions(self):
-        self.emoji_completions = list(EMOJI)
+        self.emoji_completions = list(EMOJI.keys())
         if self.emoji_completions:
             s = SlackRequest(self.token, "emoji.list", {}, team_hash=self.team_hash)
             self.eventrouter.receive(s)
@@ -1468,7 +1506,7 @@ class SlackChannelCommon(object):
         else:
             return
         data = {"channel": self.identifier, "timestamp": timestamp, "name": reaction}
-        s = SlackRequest(self.team.token, method, data)
+        s = SlackRequest(self.team.token, method, data, reaction=reaction)
         self.eventrouter.receive(s)
 
     def edit_nth_previous_message(self, msg_id, old, new, flags):
@@ -1982,9 +2020,10 @@ class SlackChannel(SlackChannelCommon):
     def render(self, message, force=False):
         text = message.render(force)
         if isinstance(message, SlackThreadMessage):
+            thread_id = message.parent_message.hash or message.parent_message.ts
             return '{}[{}]{} {}'.format(
-                w.color(config.color_thread_suffix),
-                message.parent_message.hash or message.parent_message.ts,
+                get_thread_color(thread_id),
+                thread_id,
                 w.color('reset'),
                 text)
 
@@ -2026,7 +2065,7 @@ class SlackDMChannel(SlackChannel):
 
     def update_color(self):
         if config.colorize_private_chats:
-            self.color_name = get_nick_color_name(self.name)
+            self.color_name = get_nick_color(self.name, name=True)
             self.color = w.color(self.color_name)
         else:
             self.color = ""
@@ -2101,6 +2140,13 @@ class SlackPrivateChannel(SlackGroupChannel):
     def __init__(self, eventrouter, **kwargs):
         super(SlackPrivateChannel, self).__init__(eventrouter, **kwargs)
         self.type = "private"
+
+    def set_related_server(self, team):
+        super(SlackPrivateChannel, self).set_related_server(team)
+        # Fetch members here (after the team is known) since they aren't
+        # included in rtm.start
+        s = SlackRequest(team.token, 'conversations.members', {'channel': self.identifier}, team_hash=team.team_hash, channel_identifier=self.identifier)
+        self.eventrouter.receive(s)
 
 
 class SlackMPDMChannel(SlackChannel):
@@ -2360,7 +2406,7 @@ class SlackUser(object):
     def update_color(self):
         # This will automatically be none/"" if the user has disabled nick
         # colourization.
-        self.color_name = get_nick_color_name(self.name)
+        self.color_name = get_nick_color(self.name, name=True)
         self.color = w.color(self.color_name)
 
     def update_status(self, status_emoji, status_text):
@@ -2456,9 +2502,11 @@ class SlackMessage(object):
         if self.number_of_replies():
             self.channel.hash_message(self.ts)
             text += " {}[ Thread: {} Replies: {} ]".format(
-                    w.color(config.color_thread_suffix),
+                    get_thread_color(self.hash),
                     self.hash,
                     self.number_of_replies())
+
+        text = replace_string_with_emoji(text)
 
         self.message_json["_rendered_text"] = text
         return text
@@ -2800,11 +2848,10 @@ def handle_conversationsreplies(message_json, eventrouter, **kwargs):
 def handle_conversationsmembers(members_json, eventrouter, **kwargs):
     request_metadata = members_json['wee_slack_request_metadata']
     team = eventrouter.teams[request_metadata.team_hash]
+    channel = team.channels[request_metadata.channel_identifier]
     if members_json['ok']:
-        channel = team.channels[request_metadata.channel_identifier]
-        channel.members = set(members_json['members'])
+        channel.set_members(members_json['members'])
     else:
-        channel = team.channels[request_metadata.channel_identifier]
         w.prnt(team.channel_buffer, '{}Couldn\'t load members for channel {}. Error: {}'
                 .format(w.prefix('error'), channel.name, members_json['error']))
 
@@ -2861,6 +2908,18 @@ def handle_chatcommand(json, eventrouter, **kwargs):
         response_text = '. Response: {}'.format(response) if response else ''
         w.prnt(team.channel_buffer, 'ERROR: Couldn\'t run command "{}". Error: {}{}'
                 .format(command, json['error'], response_text))
+
+
+def handle_reactionsadd(json, eventrouter, **kwargs):
+    if not json['ok']:
+        request_metadata = json['wee_slack_request_metadata']
+        print_error("Couldn't add reaction {}: {}".format(request_metadata.reaction, json['error']))
+
+
+def handle_reactionsremove(json, eventrouter, **kwargs):
+    if not json['ok']:
+        request_metadata = json['wee_slack_request_metadata']
+        print_error("Couldn't remove reaction {}: {}".format(request_metadata.reaction, json['error']))
 
 
 ###### New/converted process_ and subprocess_ methods
@@ -3159,6 +3218,7 @@ def process_channel_joined(message_json, eventrouter, **kwargs):
 
 def process_channel_created(message_json, eventrouter, **kwargs):
     item = message_json["channel"]
+    item['is_member'] = False
     c = SlackChannel(eventrouter, team=kwargs["team"], **item)
     kwargs['team'].channels[item["id"]] = c
     kwargs['team'].buffer_prnt('Channel created: {}'.format(c.slack_name))
@@ -3468,7 +3528,7 @@ def resolve_ref(ref):
 
 def create_user_status_string(profile):
     real_name = profile.get("real_name")
-    status_emoji = profile.get("status_emoji")
+    status_emoji = replace_string_with_emoji(profile.get("status_emoji", ""))
     status_text = profile.get("status_text")
     if status_emoji or status_text:
         return "{} | {} {}".format(real_name, status_emoji, status_text)
@@ -3737,7 +3797,7 @@ def whois_command_cb(data, current_buffer, command):
                 team.buffer_prnt("[{}]: {}: {}".format(user, field, value))
 
         team.buffer_prnt("[{}]: {}".format(user, u.real_name))
-        status_emoji = u.profile.get("status_emoji", "")
+        status_emoji = replace_string_with_emoji(u.profile.get("status_emoji", ""))
         status_text = u.profile.get("status_text", "")
         if status_emoji or status_text:
             team.buffer_prnt("[{}]: {} {}".format(user, status_emoji, status_text))
@@ -3771,23 +3831,23 @@ def command_register(data, current_buffer, args):
     """
     CLIENT_ID = "2468770254.51917335286"
     CLIENT_SECRET = "dcb7fe380a000cba0cca3169a5fe8d70"  # Not really a secret.
+    REDIRECT_URI = "https%3A%2F%2Fwee-slack.github.io%2Fwee-slack%2Foauth%23"
     if not args:
         message = textwrap.dedent("""
-            #### Retrieving a Slack token via OAUTH ####
-            1) Paste this into a browser: https://slack.com/oauth/authorize?client_id=2468770254.51917335286&scope=client
-            2) Select the team you wish to access from wee-slack in your browser.
-            3) Click "Authorize" in the browser **IMPORTANT: the redirect will fail, this is expected**
+            ### Connecting to a Slack team with OAuth ###
+            1) Paste this link into a browser: https://slack.com/oauth/authorize?client_id={}&scope=client&redirect_uri={}
+            2) Select the team you wish to access from wee-slack in your browser. If you want to add multiple teams, you will have to repeat this whole process for each team.
+            3) Click "Authorize" in the browser.
                If you get a message saying you are not authorized to install wee-slack, the team has restricted Slack app installation and you will have to request it from an admin. To do that, go to https://my.slack.com/apps/A1HSZ9V8E-wee-slack and click "Request to Install".
-            4) Copy the "code" portion of the URL to your clipboard
-            5) Return to weechat and run `/slack register [code]`
-        """).strip()
+            4) The web page will show a command in the form `/slack register <code>`. Run this command in weechat.
+        """).strip().format(CLIENT_ID, REDIRECT_URI)
         w.prnt("", message)
         return w.WEECHAT_RC_OK_EAT
 
     uri = (
         "https://slack.com/api/oauth.access?"
-        "client_id={}&client_secret={}&code={}"
-    ).format(CLIENT_ID, CLIENT_SECRET, args)
+        "client_id={}&client_secret={}&redirect_uri={}&code={}"
+    ).format(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, args)
     params = {'useragent': 'wee_slack {}'.format(SCRIPT_VERSION)}
     w.hook_process_hashtable('url:', params, config.slack_timeout, "", "")
     w.hook_process_hashtable("url:{}".format(uri), params, config.slack_timeout, "register_callback", "")
@@ -3822,6 +3882,7 @@ def register_callback(data, command, return_code, out, err):
 
     w.prnt("", "Success! Added team \"%s\"" % (d['team_name'],))
     w.prnt("", "Please reload wee-slack with: /python reload slack")
+    w.prnt("", "If you want to add another team you can repeat this process from step 1 before reloading wee-slack.")
     return w.WEECHAT_RC_OK_EAT
 
 
@@ -4361,7 +4422,7 @@ def command_status(data, current_buffer, args):
     if not split_args[0]:
         profile = team.users[team.myidentifier].profile
         team.buffer_prnt("Status: {} {}".format(
-            profile.get("status_emoji", ""),
+            replace_string_with_emoji(profile.get("status_emoji", "")),
             profile.get("status_text", "")))
         return w.WEECHAT_RC_OK
 
@@ -4485,12 +4546,24 @@ def create_slack_debug_buffer():
 
 def load_emoji():
     try:
-        DIR = w.info_get("weechat_dir", "")
+        DIR = w.info_get('weechat_dir', '')
         with open('{}/weemoji.json'.format(DIR), 'r') as ef:
-            return json.loads(ef.read())["emoji"]
+            emojis = json.loads(ef.read())
+            if 'emoji' in emojis:
+                print_error('The weemoji.json file is in an old format. Please update it.')
+            else:
+                emoji_unicode = {key: value['unicode'] for key, value in emojis.items()}
+
+                emoji_skin_tones = {skin_tone['name']: skin_tone['unicode']
+                        for emoji in emojis.values()
+                        for skin_tone in emoji.get('skinVariations', {}).values()}
+
+                emoji_with_skin_tones = chain(emoji_unicode.items(), emoji_skin_tones.items())
+                emoji_with_skin_tones_reverse = {v: k for k, v in emoji_with_skin_tones}
+                return emoji_unicode, emoji_with_skin_tones_reverse
     except:
         dbg("Couldn't load emoji list: {}".format(format_exc_only()), 5)
-    return []
+    return {}, {}
 
 
 def setup_hooks():
@@ -4642,7 +4715,8 @@ class PluginConfig(object):
         'color_thread_suffix': Setting(
             default='lightcyan',
             desc='Color to use for the [thread: XXX] suffix on messages that'
-            ' have threads attached to them.'),
+            ' have threads attached to them. The special value "multiple" can'
+            ' be used to use a different color for each thread.'),
         'colorize_private_chats': Setting(
             default='false',
             desc='Whether to use nick-colors in DM windows.'),
@@ -4694,6 +4768,13 @@ class PluginConfig(object):
         'render_bold_as': Setting(
             default='bold',
             desc='When receiving bold text from Slack, render it as this in weechat.'),
+        'render_emoji_as_string': Setting(
+            default='false',
+            desc="Render emojis as :emoji_name: instead of emoji characters. Enable this"
+            " if your terminal doesn't support emojis. Note that even though this is"
+            " disabled by default, you need to place {}/blob/master/weemoji.json in your"
+            " weechat directory to enable rendering emojis as emoji characters."
+            .format(REPO_URL)),
         'render_italic_as': Setting(
             default='italic',
             desc='When receiving bold text from Slack, render it as this in weechat.'
@@ -4940,7 +5021,7 @@ if __name__ == "__main__":
             w.hook_config("plugins.var.python." + SCRIPT_NAME + ".*", "config_changed_cb", "")
             w.hook_modifier("input_text_for_buffer", "input_text_for_buffer_cb", "")
 
-            EMOJI.extend(load_emoji())
+            EMOJI, EMOJI_WITH_SKIN_TONES_REVERSE = load_emoji()
             setup_hooks()
 
             # attach to the weechat hooks we need
